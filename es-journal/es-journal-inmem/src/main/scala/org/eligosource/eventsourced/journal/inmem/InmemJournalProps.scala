@@ -17,7 +17,7 @@ package org.eligosource.eventsourced.journal.inmem
 
 import akka.actor.Actor
 
-import org.eligosource.eventsourced.core._
+import org.eligosource.eventsourced.journal.common.JournalProps
 
 /**
  * Configuration object for an in-memory based journal. For testing purposes only.
@@ -43,17 +43,29 @@ case class InmemJournalProps(
   dispatcherName: Option[String] = None) extends JournalProps {
 
   /**
+   * Java API.
+   *
    * Returns a new `InmemJournalProps` with specified journal actor name.
    */
   def withName(name: String) =
     copy(name = Some(name))
 
   /**
+   * Java API.
+   *
    * Returns a new `InmemJournalProps` with specified journal actor dispatcher name.
    */
   def withDispatcherName(dispatcherName: String) =
     copy(dispatcherName = Some(dispatcherName))
 
-  def journal: Actor =
+  def createJournalActor: Actor =
     new InmemJournal
+}
+
+object InmemJournalProps {
+  /**
+   * Java API.
+   */
+  def create =
+    new InmemJournalProps()
 }

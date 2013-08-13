@@ -17,9 +17,16 @@ package org.eligosource.eventsourced.journal.journalio
 
 import java.io.File
 
+import scala.concurrent.duration._
+
 import akka.actor.Actor
 
-import org.eligosource.eventsourced.core._
+import org.apache.hadoop.fs.{FileSystem, Path}
+
+import org.eligosource.eventsourced.journal.common.JournalProps
+import org.eligosource.eventsourced.journal.common.serialization.SnapshotSerializer
+import org.eligosource.eventsourced.journal.common.snapshot.HadoopFilesystemSnapshottingProps
+import org.eligosource.eventsourced.journal.common.snapshot.HadoopFilesystemSnapshotting.defaultLocalFilesystem
 
 /**
  * Configuration object for a [[https://github.com/sbtourist/Journal.IO Journal.IO]] based journal. It
@@ -62,32 +69,101 @@ case class JournalioJournalProps(
   name: Option[String] = None,
   dispatcherName: Option[String] = None,
   fsync: Boolean = false,
-  checksum: Boolean = false) extends JournalProps {
+  checksum: Boolean = false,
+  snapshotDir: Path = new Path("snapshots"),
+  snapshotSerializer: SnapshotSerializer = SnapshotSerializer.java,
+  snapshotLoadTimeout: FiniteDuration = 1 hour,
+  snapshotSaveTimeout: FiniteDuration = 1 hour,
+  snapshotFilesystem: FileSystem = defaultLocalFilesystem)
+  extends JournalProps with HadoopFilesystemSnapshottingProps[JournalioJournalProps] {
+
+  val snapshotPath =
+    if (!snapshotDir.isAbsolute && snapshotFilesystem == defaultLocalFilesystem) {
+      // default local file system and relative snapshot dir:
+      // store snapshots relative to journal dir
+      new Path(new Path(dir.toURI), snapshotDir)
+    } else snapshotDir
 
   /**
+   * Java API.
+   *
    * Returns a new `JournalioJournalProps` with specified journal actor name.
    */
   def withName(name: String) =
     copy(name = Some(name))
 
   /**
+   * Java API.
+   *
    * Returns a new `JournalioJournalProps` with specified journal actor dispatcher name.
    */
   def withDispatcherName(dispatcherName: String) =
     copy(dispatcherName = Some(dispatcherName))
 
   /**
+   * Java API.
+   *
    * Returns a new `JournalioJournalProps` with specified physical sync setting.
    */
   def withFsync(fsync: Boolean) =
     copy(fsync = fsync)
 
   /**
+   * Java API.
+   *
    * Returns a new `JournalioJournalProps` with specified checksum verification setting.
    */
   def withChecksum(checksum: Boolean) =
     copy(checksum = checksum)
 
-  def journal: Actor =
+  /**
+   * Java API.
+   *
+   * Returns a new `JournalioJournalProps` with specified snapshot dir.
+   */
+  def withSnapshotDir(snapshotDir: Path) =
+    copy(snapshotDir = snapshotDir)
+
+  /**
+   * Java API.
+   *
+   * Returns a new `JournalioJournalProps` with specified snapshot serializer.
+   */
+  def withSnapshotSerializer(snapshotSerializer: SnapshotSerializer) =
+    copy(snapshotSerializer = snapshotSerializer)
+
+  /**
+   * Java API.
+   *
+   * Returns a new `JournalioJournalProps` with specified snapshot load timeout.
+   */
+  def withSnapshotLoadTimeout(snapshotLoadTimeout: FiniteDuration) =
+    copy(snapshotLoadTimeout = snapshotLoadTimeout)
+
+  /**
+   * Java API.
+   *
+   * Returns a new `JournalioJournalProps` with specified snapshot save timeout.
+   */
+  def withSnapshotSaveTimeout(snapshotSaveTimeout: FiniteDuration) =
+    copy(snapshotSaveTimeout = snapshotSaveTimeout)
+
+  /**
+   * Java API.
+   *
+   * Returns a new `JournalioJournalProps` with specified snapshot filesystem.
+   */
+  def withSnapshotFilesystem(snapshotFilesystem: FileSystem) =
+    copy(snapshotFilesystem = snapshotFilesystem)
+
+  def createJournalActor: Actor =
     new JournalioJournal(this)
+}
+
+object JournalioJournalProps {
+  /**
+   * Java API.
+   */
+  def create(dir: File) =
+    JournalioJournalProps(dir)
 }

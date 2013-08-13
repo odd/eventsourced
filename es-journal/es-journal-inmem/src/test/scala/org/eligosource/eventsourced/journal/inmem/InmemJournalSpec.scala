@@ -17,6 +17,4 @@ package org.eligosource.eventsourced.journal.inmem
 
 import org.eligosource.eventsourced.journal.common.JournalSpec
 
-class InmemJournalSpec extends JournalSpec {
-  def journalProps = InmemJournalProps()
-}
+class InmemJournalSpec extends JournalSpec with InmemJournalLifecycle

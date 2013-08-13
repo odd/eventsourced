@@ -15,8 +15,7 @@
  */
 package org.eligosource.eventsourced.journal.journalio
 
-import java.io.File
-import java.util.concurrent.Executors
+import java.util.concurrent.{Executor, Executors}
 
 import scala.collection.JavaConverters._
 
@@ -25,6 +24,10 @@ import journal.io.api.{Journal => JournalIO, _}
 
 import org.eligosource.eventsourced.core._
 import org.eligosource.eventsourced.journal.common._
+import org.eligosource.eventsourced.journal.common.serialization._
+import org.eligosource.eventsourced.journal.common.snapshot.HadoopFilesystemSnapshotting
+import org.eligosource.eventsourced.journal.common.support.SynchronousWriteReplaySupport
+import org.eligosource.eventsourced.journal.common.util._
 
 /**
  * [[https://github.com/sbtourist/Journal.IO Journal.IO]] based journal.
@@ -39,8 +42,8 @@ import org.eligosource.eventsourced.journal.common._
  *
  *  - replay of input messages for a single processor requires full scan (with optional lower bound)
  */
-private [eventsourced] class JournalioJournal(props: JournalioJournalProps) extends SequentialWriteJournal {
-  import Journal._
+private [eventsourced] class JournalioJournal(val props: JournalioJournalProps) extends SynchronousWriteReplaySupport with HadoopFilesystemSnapshotting {
+  import JournalProtocol._
 
   val writeInMsgQueue = new WriteInMsgQueue
   val writeOutMsgCache = new WriteOutMsgCache[Location]
@@ -48,7 +51,7 @@ private [eventsourced] class JournalioJournal(props: JournalioJournalProps) exte
   val disposer = Executors.newSingleThreadScheduledExecutor()
   val journal = new JournalIO
 
-  val serialization = Serialization(context.system)
+  val serialization = CommandSerialization(context.system)
 
   implicit def cmdToBytes(cmd: AnyRef): Array[Byte] = serialization.serializeCommand(cmd)
   implicit def cmdFromBytes(bytes: Array[Byte]): AnyRef = serialization.deserializeCommand(bytes)
@@ -82,18 +85,19 @@ private [eventsourced] class JournalioJournal(props: JournalioJournalProps) exte
   }
 
   def executeBatchReplayInMsgs(cmds: Seq[ReplayInMsgs], p: (Message, ActorRef) => Unit) {
-    val starts = cmds.foldLeft(Map.empty[Int, (Long, ActorRef)]) { (a, r) =>
-      a + (r.processorId -> (r.fromSequenceNr, r.target))
+    val ranges = cmds.foldLeft(Map.empty[Int, (Long, Long, ActorRef)]) { (a, r) =>
+      a + (r.processorId -> (r.fromSequenceNr, r.toSequenceNr, r.target))
     }
     replayInput { (cmd, acks) =>
-      starts.get(cmd.processorId) match {
-        case Some((fromSequenceNr, target)) if (cmd.message.sequenceNr >= fromSequenceNr) => {
+      ranges.get(cmd.processorId) match {
+        case Some((fromSequenceNr, toSequenceNr, target))
+          if (cmd.message.sequenceNr >= fromSequenceNr &&
+              cmd.message.sequenceNr <= toSequenceNr) => {
           p(cmd.message.copy(acks = acks), target)
         }
         case _ => {}
       }
     }
-    sender ! ReplayDone
   }
 
   def executeReplayInMsgs(cmd: ReplayInMsgs, p: Message => Unit) {
@@ -127,16 +131,23 @@ private [eventsourced] class JournalioJournal(props: JournalioJournalProps) exte
 
   def storedCounter: Long = {
     val cmds = journal.undo().asScala.map { location => cmdFromBytes(location.getData) }
-    val cmdo = cmds.collectFirst { case cmd: WriteInMsg => cmd }
-    cmdo.map(_.message.sequenceNr).getOrElse(0L)
+    val msgo = cmds.collectFirst {
+      case cmd: WriteInMsg  => cmd.message
+      case cmd: WriteOutMsg => cmd.message
+    }
+    msgo.map(_.sequenceNr).getOrElse(0L)
   }
 
   override def start() {
     props.dir.mkdirs()
+    initSnapshotting()
 
+    context.dispatcher match {
+      case e: Executor => journal.setWriter(e)
+      case _           => // use internal writer
+    }
     journal.setPhysicalSync(props.fsync)
     journal.setDirectory(props.dir)
-    journal.setWriter(context.dispatcher)
     journal.setDisposer(disposer)
     journal.setChecksum(props.checksum)
     journal.open()
@@ -146,13 +157,4 @@ private [eventsourced] class JournalioJournal(props: JournalioJournalProps) exte
     journal.close()
     disposer.shutdown()
   }
-}
-
-/**
- * @see [[org.eligosource.eventsourced.journal.JournalioJournalProps]]
- */
-object JournalioJournal {
-  @deprecated("use Journal(JournalioJournalProps(dir)) instead", "0.5")
-  def apply(dir: File, name: Option[String] = None, dispatcherName: Option[String] = None)(implicit system: ActorSystem): ActorRef =
-    Journal(JournalioJournalProps(dir, name, dispatcherName))
 }

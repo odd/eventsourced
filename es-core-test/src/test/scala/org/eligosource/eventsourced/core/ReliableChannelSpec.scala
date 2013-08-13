@@ -22,8 +22,7 @@ import java.util.concurrent.LinkedBlockingQueue
 
 import akka.actor._
 
-import org.eligosource.eventsourced.core.Channel._
-import org.eligosource.eventsourced.core.Journal._
+import org.eligosource.eventsourced.core.JournalProtocol._
 import org.eligosource.eventsourced.core.ReliableChannelSpec._
 
 class ReliableChannelSpec extends EventsourcingSpec[Fixture] {
@@ -121,7 +120,7 @@ class ReliableChannelSpec extends EventsourcingSpec[Fixture] {
       dq() must be (Left(Message("a", sequenceNr = 1L)))
       dq() must be (Right(Message("a", sequenceNr = 1L)))
     }
-    "preserve the message sender reaching maxRedelivery" in { fixture =>
+    "preserve the message sender after reaching maxRedelivery" in { fixture =>
       import fixture._
 
       val c = channel(failureDestination(failAtEvent = "a", enqueueFailures = true, failureCount = 4))
@@ -136,30 +135,6 @@ class ReliableChannelSpec extends EventsourcingSpec[Fixture] {
       dq() must be (Left(Message("a", sequenceNr = 1L)))
       dq() must be (Left(Message("a", sequenceNr = 1L)))
       dq() must be (Right(Message("a", sequenceNr = 1L)))
-    }
-    "tolerate invalid actor paths" in { fixture =>
-      import fixture._
-
-      class Destination extends Actor { this: Receiver =>
-        def receive = { case event => sender ! event }
-      }
-
-      val dlq = new LinkedBlockingQueue[Any]
-
-      writeOutMsg(Message("a", sequenceNr = 1L, senderPath = "akka://test/temp/x"))
-      writeOutMsg(Message("b", sequenceNr = 2L, senderPath = "akka://test/user/y"))
-
-      system.eventStream.subscribe(system.actorOf(Props(new Actor {
-        def receive = { case DeadLetter(response, _, _) => dlq add response }
-      })), classOf[DeadLetter])
-
-      val d = system.actorOf(Props(new Destination with Receiver with Confirm))
-      val c = channel(d)
-
-      c ! Deliver
-
-      dequeue(dlq) must be("a")
-      dequeue(dlq) must be("b")
     }
     "publish DeliveryStopped to event stream when reaching restartMax" in { fixture =>
       import fixture._
@@ -270,6 +245,12 @@ class ReliableChannelSpec extends EventsourcingSpec[Fixture] {
       c ! Deliver
       dq() must be (Right(Message(1, sequenceNr = 1L)))
     }
+    "not have an id < 1" in { fixture =>
+      import fixture._
+
+      intercept[InvalidChannelIdException](extension.channelOf(ReliableChannelProps(0, successDestination)))
+      intercept[InvalidChannelIdException](extension.channelOf(ReliableChannelProps(-1, successDestination)))
+    }
   }
 }
 
@@ -286,8 +267,7 @@ object ReliableChannelSpec {
     val writeOutMsgListener = system.actorOf(Props(new WriteOutMsgListener(writeOutMsgListenerQueue)))
 
     val policy = new RedeliveryPolicy(5 seconds, 10 milliseconds, 1, 10 milliseconds, 3)
-    def channel(destination: ActorRef) = system.actorOf(Props(new ReliableChannel(1, journal, destination, policy)))
-
+    def channel(destination: ActorRef) = extension.channelOf(ReliableChannelProps(1, destination, policy))
 
     def dq(queue: LinkedBlockingQueue[Either[Message, Message]]): Either[Message, Message] = super.dequeue(queue) match {
       case Left(msg)  => Left(Message(msg.event, sequenceNr = msg.sequenceNr))

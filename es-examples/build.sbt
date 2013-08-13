@@ -1,5 +1,3 @@
-Nobootcp.settings
-
 libraryDependencies ++= Seq(
-  "com.typesafe.akka" %% "akka-cluster-experimental" % Version.Akka % "compile"
+  "com.typesafe.akka" %% "akka-cluster" % Version.Akka % "compile"
 )

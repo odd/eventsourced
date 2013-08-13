@@ -17,6 +17,7 @@ package org.eligosource.eventsourced.example
 
 import java.io.File
 
+import scala.concurrent.Future
 import scala.concurrent.duration._
 
 import akka.actor._
@@ -27,8 +28,7 @@ import akka.util.Timeout
 import com.typesafe.config.ConfigFactory
 
 import org.eligosource.eventsourced.core._
-import org.eligosource.eventsourced.core.Channel._
-import org.eligosource.eventsourced.journal.journalio._
+import org.eligosource.eventsourced.journal.leveldb._
 import org.eligosource.eventsourced.patterns.reliable.requestreply._
 
 // ------------------------------------
@@ -144,10 +144,7 @@ class OrderProcessor(val id: Int) extends Actor with ActorLogging { this: Receiv
       import context.dispatcher
       val initiator = sender
       val composite = for {
-        _ <- ext.replay {
-          case `id` => Some(0L)
-          case _    => None
-        } (timeout)
+        _  <- ext.replay(Seq(ReplayParams(id)))(timeout)
         _  <- ext.deliver(validationRequestChannelId)(timeout)
         _  <- ext.deliver(validOrderChannelId)(timeout)
         _  <- ext.deliver(invalidOrderChannelId)(timeout)
@@ -194,18 +191,23 @@ object OrderProcessor extends App {
   import system.dispatcher
 
   val log = Logging(system, this.getClass)
-  val journal = Journal(JournalioJournalProps(new File("target/orders")))
+  val journal = LeveldbJournalProps(new File("target/orders"), native = false).createJournal
   val extension = EventsourcingExtension(system, journal)
 
   val processor = extension.processorOf(ProcessorProps(1, id => new OrderProcessor(id) with Receiver with Eventsourced, Some("processor")))
   val destination = system.actorOf(Props(new OrderDestination with Receiver with Confirm), "destination")
-  val validator = system.actorFor("akka://example@127.0.0.1:2852/user/validator")
 
-  processor ! SetCreditCardValidator(validator)
-  processor ! SetValidOrderDestination(destination)
-  processor ! SetInvalidOrderDestination(destination)
+  def processorInit: Future[Unit] = system.actorSelection("akka.tcp://example@127.0.0.1:2852/user/validator") ? Identify(1) flatMap {
+    case ActorIdentity(1, None) => Future.failed(new Exception("validator lookup failed"))
+    case ActorIdentity(1, Some(validator)) => Future.successful {
+      processor ! SetCreditCardValidator(validator)
+      processor ! SetValidOrderDestination(destination)
+      processor ! SetInvalidOrderDestination(destination)
+    }
+  }
 
   for {
+    _ <- processorInit
     _ <- processor ? Recover(timeout)
     r1 <- processor ? Message(OrderSubmitted(Order(details = "jelly beans", creditCardNumber = "1234-5678-1234-5678")))
     r2 <- processor ? Message(OrderSubmitted(Order(details = "jelly beans", creditCardNumber = "1234-5678-1234-0000")))

@@ -15,25 +15,28 @@
  */
 package org.eligosource.eventsourced.journal.leveldb
 
-import java.io.File
-
 import akka.actor._
 
-import org.eligosource.eventsourced.core.Journal
+import org.iq80.leveldb._
 
-/**
- * @see [[org.eligosource.eventsourced.journal.leveldb.LeveldbJournalProps]]
- */
-object LeveldbJournal {
-  @deprecated("use Journal(LeveldbJournalProps(dir)) instead", "0.5")
-  def processorStructured(dir: File, name: Option[String] = None, dispatcherName: Option[String] = None)(implicit system: ActorSystem): ActorRef =
-    Journal(LeveldbJournalProps(dir, name, dispatcherName))
+import org.eligosource.eventsourced.journal.common.serialization.CommandSerialization
 
-  @deprecated("use Journal(LeveldbJournalProps(dir).withSequenceStructure) instead", "0.5")
-  def sequenceStructured(dir: File, name: Option[String] = None, dispatcherName: Option[String] = None)(implicit system: ActorSystem): ActorRef =
-    Journal(LeveldbJournalProps(dir, name, dispatcherName).withSequenceStructure)
+trait LeveldbJournal { this: Actor =>
+  def props: LeveldbJournalProps
 
-  @deprecated("use Journal(LeveldbJournalProps(dir)) instead", "0.5")
-  def apply(dir: File, name: Option[String] = None, dispatcherName: Option[String] = None)(implicit system: ActorSystem) =
-    processorStructured(dir, name = name, dispatcherName = dispatcherName)
+  val levelDbReadOptions = new ReadOptions().verifyChecksums(props.checksum)
+  val levelDbWriteOptions = new WriteOptions().sync(props.fsync)
+  val leveldb = factory.open(props.dir, leveldbOptions)
+
+  val serialization = CommandSerialization(context.system)
+
+  def factory = {
+    if (props.native) org.fusesource.leveldbjni.JniDBFactory.factory
+    else org.iq80.leveldb.impl.Iq80DBFactory.factory
+  }
+
+  def leveldbOptions = {
+    val options = new Options().createIfMissing(true)
+    if (props.native) options else options.compressionType(CompressionType.NONE)
+  }
 }

@@ -15,7 +15,6 @@
  */
 package org.eligosource.eventsourced.journal.common
 
-import java.io.File
 import java.util.concurrent._
 
 import scala.concurrent.Await
@@ -28,13 +27,11 @@ import akka.util.Timeout
 
 import com.typesafe.config.ConfigFactory
 
-import org.apache.commons.io.FileUtils
-
 import org.scalatest.fixture._
 import org.scalatest.matchers.MustMatchers
 
 import org.eligosource.eventsourced.core._
-import org.eligosource.eventsourced.core.Journal._
+import org.eligosource.eventsourced.core.JournalProtocol._
 
 abstract class JournalSpec extends WordSpec with MustMatchers {
   import JournalSpec._
@@ -43,10 +40,10 @@ abstract class JournalSpec extends WordSpec with MustMatchers {
 
   class Fixture {
     implicit val system = ActorSystem("test", ConfigFactory.load("persist"))
-    implicit val duration = 5 seconds
+    implicit val duration = 10 seconds
     implicit val timeout = Timeout(duration)
 
-    val journal = Journal(journalProps)
+    val journal = journalProps.createJournal
 
     val writeQueue = new LinkedBlockingQueue[Message]
     val writeTarget = system.actorOf(Props(new CommandTarget(writeQueue)))
@@ -55,7 +52,7 @@ abstract class JournalSpec extends WordSpec with MustMatchers {
     val replayTarget = system.actorOf(Props(new CommandTarget(replayQueue)))
 
     def dequeue(queue: LinkedBlockingQueue[Message])(p: Message => Unit) {
-      p(queue.poll(5000, TimeUnit.MILLISECONDS))
+      p(queue.poll(duration.toMillis, TimeUnit.MILLISECONDS))
     }
 
     def replayInMsgs(processorId: Int, fromSequenceNr: Long, target: ActorRef) {
@@ -89,7 +86,7 @@ abstract class JournalSpec extends WordSpec with MustMatchers {
       replayInMsgs(1, 0, replayTarget)
 
       dequeue(replayQueue) { m => m must be(Message("test-1", sequenceNr = 1, timestamp = m.timestamp)); m.timestamp must be > (0L) }
-      dequeue(replayQueue) { m => m must be(Message("test-2", sequenceNr = 2, timestamp = m.timestamp)); m.timestamp must be > (0L)  }
+      dequeue(replayQueue) { m => m must be(Message("test-2", sequenceNr = 2, timestamp = m.timestamp)); m.timestamp must be > (0L) }
     }
     "persist but not timestamp output messages" in { fixture =>
       import fixture._
@@ -152,9 +149,15 @@ abstract class JournalSpec extends WordSpec with MustMatchers {
         ReplayInMsgs(3, 6L, replayTarget)
       )), duration)
 
-      dequeue(replayQueue) { m => m must be(Message("test-1a", sequenceNr = 1, timestamp = m.timestamp)) }
-      dequeue(replayQueue) { m => m must be(Message("test-1b", sequenceNr = 2, timestamp = m.timestamp)) }
-      dequeue(replayQueue) { m => m must be(Message("test-3b", sequenceNr = 6, timestamp = m.timestamp)) }
+      // A journal may concurrently replay messages to different
+      // processors ...
+
+      def poll() = replayQueue.poll(10000, TimeUnit.MILLISECONDS)
+      val msgs = List.fill(3)(poll()).map(_.copy(timestamp = 0L))
+
+      msgs must contain(Message("test-1a", sequenceNr = 1))
+      msgs must contain(Message("test-1b", sequenceNr = 2))
+      msgs must contain(Message("test-3b", sequenceNr = 6))
     }
     "tolerate phantom acknowledgements" in { fixture =>
       import fixture._
@@ -193,5 +196,85 @@ object JournalSpec {
       case Written(msg) => queue.put(msg)
     }
   }
+}
+
+abstract class PersistentJournalSpec extends JournalSpec {
+  import JournalSpec._
+
+  "recover its counter when started" in { fixture =>
+    import fixture._
+
+    journal ! WriteInMsg(1, Message("test-1"), writeTarget)
+    journal ! WriteInMsg(1, Message("test-2"), writeTarget)
+    journal ! WriteOutMsg(1, Message("test-3"), 1, SkipAck, writeTarget)
+    journal ! ReplayOutMsgs(1, 0, replayTarget)
+
+    dequeue(replayQueue) { m => m must be(Message("test-3", sequenceNr = 3)) }
+
+    system.shutdown()
+    system.awaitTermination(duration)
+
+    val anotherSystem = ActorSystem("test")
+    val anotherJournal = journalProps.createJournal(anotherSystem)
+    val anotherReplayTarget = anotherSystem.actorOf(Props(new CommandTarget(replayQueue)))
+
+    anotherJournal ! WriteInMsg(1, Message("test-4"), writeTarget)
+    anotherJournal ! ReplayInMsgs(1, 4, anotherReplayTarget)
+
+    dequeue(replayQueue) { m => m must be(Message("test-4", sequenceNr = 4, timestamp = m.timestamp)) }
+
+    anotherSystem.shutdown()
+    anotherSystem.awaitTermination(duration)
+  }
+  "reset temporary sender paths for previously persisted output messages" in { fixture =>
+    import fixture._
+
+    class A(journal: ActorRef) extends Actor {
+      var ref: ActorRef = _
+
+      def receive = {
+        case "get" => sender ! ref
+        case "init-1" => { journal ! WriteOutMsg(1, Message("test-1", senderRef = self), 0, SkipAck, writeTarget) }
+        case "init-2" => { journal ! WriteOutMsg(1, Message("test-2", senderRef = sender), 0, SkipAck, writeTarget); ref = sender }
+        case "init-3" => { journal ! WriteOutMsg(1, Message("test-3", senderRef = sender), 0, SkipAck, writeTarget); ref = sender }
+      }
+    }
+
+    val r1 = system.actorOf(Props(new A(journal)))
+
+    r1 ! "init-1"
+    r1 ? "init-2"
+
+    val r2 = Await.result(r1.ask("get")(timeout), timeout.duration)
+
+    journal ! ReplayOutMsgs(1, 0, replayTarget)
+
+    dequeue(replayQueue) { m => m.senderRef must be(r1) }
+    dequeue(replayQueue) { m => m.senderRef must be(r2) }
+
+    system.shutdown()
+    system.awaitTermination(duration)
+
+    val anotherSystem = ActorSystem("test")
+    val anotherJournal = journalProps.createJournal(anotherSystem)
+    val anotherReplayTarget = anotherSystem.actorOf(Props(new CommandTarget(replayQueue)))
+    val anotherR1 = anotherSystem.actorOf(Props(new A(anotherJournal)))
+
+    anotherR1 ? "init-3"
+
+    val r3 = Await.result(anotherR1.ask("get")(timeout), timeout.duration)
+
+    prepareJournal(anotherJournal, anotherSystem)
+    anotherJournal ! ReplayOutMsgs(1, 0, anotherReplayTarget)
+
+    dequeue(replayQueue) { m => m.senderRef must be(r1); m.senderRef must not be(anotherR1) }
+    dequeue(replayQueue) { m => m.senderRef must be(null) } // sender ref reset
+    dequeue(replayQueue) { m => m.senderRef must be(r3) }
+
+    anotherSystem.shutdown()
+    anotherSystem.awaitTermination(duration)
+  }
+
+  def prepareJournal(journal: ActorRef, system: ActorSystem) {}
 }
 

@@ -17,15 +17,25 @@ import sbt._
 import Keys._
 
 import com.typesafe.sbt.osgi.SbtOsgi.{ OsgiKeys, osgiSettings, defaultOsgiSettings }
+import com.typesafe.sbt.SbtGhPages._
+import com.typesafe.sbt.SbtGit.{GitKeys => git}
+import com.typesafe.sbt.SbtSite._
+
+import net.virtualvoid.sbt.graph.{Plugin => Dep}
+
+import sbtunidoc.Plugin._
+import sbtunidoc.Plugin.UnidocKeys._
 
 object Version {
-  val Scala = "2.10.0"
-  val Akka  = "2.1.1"
+  val Scala = "2.10.1"
+  val Akka = "2.2.0-RC1"
+  val Hadoop = "1.1.1"
+  val ScalaTest = "1.9.1"
 }
 
 object Compiler {
   val defaultSettings = Seq(
-    scalacOptions in Compile ++= Seq("-target:jvm-1.6", "-unchecked", "-feature", "-language:postfixOps", "-language:implicitConversions"),
+    scalacOptions in Compile ++= Seq("-target:jvm-1.6", "-deprecation", "-unchecked", "-feature", "-language:postfixOps", "-language:implicitConversions"),
     javacOptions in Compile ++= Seq("-source", "1.6", "-target", "1.6")
   )
 }
@@ -102,18 +112,25 @@ object EventsourcedBuild extends Build {
     Compiler.defaultSettings ++
     Publish.defaultSettings ++
     Tests.defaultSettings ++
-    Osgi.defaultSettings
+    Osgi.defaultSettings ++
+    Dep.graphSettings
 
   lazy val unidocExcludeSettings = Seq(
-    Unidoc.unidocExclude := Seq(esCoreTest.id, esExamples.id)
+    excludedProjects in unidoc in ScalaUnidoc ++= Seq(esCoreTest.id, esExamples.id)
   )
-  lazy val unidocSettings =
-    Unidoc.defaultSettings ++ unidocExcludeSettings
+
+  lazy val unidocDefaultSettings =
+    unidocSettings ++ unidocExcludeSettings
+
+  lazy val siteDefaultSettings = site.settings ++ ghpages.settings ++ Seq(
+    git.gitRemoteRepo := "git@github.com:eligosource/eventsourced.git",
+    site.addMappingsToSiteDir(mappings in packageDoc in ScalaUnidoc, "api/snapshot")
+  )
 
   lazy val es = Project(
     id = "eventsourced",
     base = file("."),
-    settings = defaultSettings ++ unidocSettings ++ Publish.parentSettings
+    settings = defaultSettings ++ unidocDefaultSettings ++ siteDefaultSettings ++ Publish.parentSettings
   ) aggregate(esCore, esCoreTest, esExamples, esJournal)
 
   lazy val esCore = Project(
@@ -126,19 +143,19 @@ object EventsourcedBuild extends Build {
     id = "eventsourced-core-test",
     base = file("es-core-test"),
     settings = defaultSettings
-  ) dependsOn(esCore, esJournalLeveldb)
+  ) dependsOn(esCore, esJournalLeveldb % "test->test;compile->compile")
 
   lazy val esExamples = Project(
     id = "eventsourced-examples",
     base = file("es-examples"),
     settings = defaultSettings
-  ) dependsOn(esCore, esCoreTest % "compile->test", esJournalLeveldb, esJournalJournalio)
+  ) dependsOn(esCore, esCoreTest % "compile->test", esJournalInmem, esJournalLeveldb, esJournalJournalio)
 
   lazy val esJournal = Project(
     id = "eventsourced-journal",
     base = file("es-journal"),
     settings = defaultSettings ++ Publish.parentSettings
-  ) aggregate(esJournalCommon, esJournalInmem, esJournalLeveldb, esJournalJournalio)
+  ) aggregate(esJournalCommon, esJournalInmem, esJournalHbase, esJournalLeveldb, esJournalJournalio, esJournalMongodbCasbah, esJournalMongodbReactive, esJournalDynamodb)
 
   lazy val esJournalCommon = Project(
     id = "eventsourced-journal-common",
@@ -152,6 +169,12 @@ object EventsourcedBuild extends Build {
     settings = defaultSettings
   ) dependsOn(esJournalCommon % "test->test;compile->compile")
 
+  lazy val esJournalHbase = Project(
+    id = "eventsourced-journal-hbase",
+    base = file("es-journal/es-journal-hbase"),
+    settings = defaultSettings ++ Defaults.itSettings
+  ) dependsOn(esJournalCommon % "it->test;compile->compile") configs( IntegrationTest )
+
   lazy val esJournalLeveldb = Project(
     id = "eventsourced-journal-leveldb",
     base = file("es-journal/es-journal-leveldb"),
@@ -163,4 +186,23 @@ object EventsourcedBuild extends Build {
     base = file("es-journal/es-journal-journalio"),
     settings = defaultSettings
   ) dependsOn(esJournalCommon % "test->test;compile->compile")
+
+  lazy val esJournalMongodbCasbah = Project(
+    id = "eventsourced-journal-mongodb-casbah",
+    base = file("es-journal/es-journal-mongodb-casbah"),
+    settings = defaultSettings
+  ) dependsOn(esJournalCommon % "test->test;compile->compile")
+
+  lazy val esJournalMongodbReactive = Project(
+    id = "eventsourced-journal-mongodb-reactive",
+    base = file("es-journal/es-journal-mongodb-reactive"),
+    settings = defaultSettings ++ Defaults.itSettings
+  ) dependsOn(esJournalCommon % "it->test;compile->compile") configs( IntegrationTest )
+
+  lazy val esJournalDynamodb = Project(
+    id = "eventsourced-journal-dynamodb",
+    base = file("es-journal/es-journal-dynamodb"),
+    settings = defaultSettings ++ Defaults.itSettings
+  ) dependsOn(esJournalCommon % "it->test;compile->compile") configs( IntegrationTest )
+
 }

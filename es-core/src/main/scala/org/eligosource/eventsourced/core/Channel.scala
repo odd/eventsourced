@@ -20,12 +20,29 @@ import scala.collection.immutable.Queue
 
 import akka.actor._
 
-import org.eligosource.eventsourced.core.Journal._
+import org.eligosource.eventsourced.core.JournalProtocol._
 
 /**
  * A channel keeps track of successfully delivered event [[org.eligosource.eventsourced.core.Message]]s.
  * Channels are used by [[org.eligosource.eventsourced.core.Eventsourced]] actors to prevent redundant
  * message delivery to destinations during event message replay.
+ *
+ * For channels to work properly, `Eventsourced` processors must copy the `processorId` and `sequenceNr`
+ * values from a received (and journaled) input event message to output event messages. This is usually
+ * done by calling `copy()` on the received input event message and updating only those fields that are
+ * relevant for the application such as `event` or `ack`, for example:
+ * {{{
+ *  class Processor(channel: ActorRef) extends Actor {
+ *    def receive = {
+ *      case msg: Message => {
+ *        // ...
+ *        channel ! msg.copy(event = ..., ack = ...)
+ *      }
+ *    }
+ *  }
+ * }}}
+ *
+ * When using an [[org.eligosource.eventsourced.core.Emitter]], this is done automatically.
  *
  * A less reliable alternative to channels is communication via sender references. Event messages that
  * are sent to processors during a replay always have a `deadLetters` sender reference which prevents
@@ -40,10 +57,9 @@ import org.eligosource.eventsourced.core.Journal._
  */
 trait Channel extends Actor {
   private val extension = EventsourcingExtension(context.system)
-  implicit val executionContext = context.dispatcher
 
   /**
-   * Channel id. Must be a positive integer.
+   * Channel id.
    */
   def id: Int
 
@@ -61,25 +77,29 @@ trait Channel extends Actor {
   }
 }
 
-object Channel {
-
+/**
+ * Channel command for starting delivery of pending event messages.
+ */
+case object Deliver {
   /**
-   * Channel command for starting delivery of pending event messages.
-   */
-  case object Deliver
-
-  /**
-   * Channel event that is published when a reliable channel (identified by `channelId`)
-   * stops event message delivery. The event is published to the event stream of the
-   * [[akka.actor.ActorSystem]] the reliable channel belongs to.
+   * Java API.
    *
-   * @param channelId id of the reliable channel that stopped event message
-   *        delivery.
-   *
-   * @see [[org.eligosource.eventsourced.core.ReliableChannel]]
+   * Returns this object.
    */
-  case class DeliveryStopped(channelId: Int)
+  def get = this
 }
+
+/**
+ * Channel event that is published when a reliable channel (identified by `channelId`)
+ * stops event message delivery. The event is published to the event stream of the
+ * [[akka.actor.ActorSystem]] the reliable channel belongs to.
+ *
+ * @param channelId id of the reliable channel that stopped event message
+ *        delivery.
+ *
+ * @see [[org.eligosource.eventsourced.core.ReliableChannel]]
+ */
+case class DeliveryStopped(channelId: Int)
 
 /**
  * A transient channel that sends event [[org.eligosource.eventsourced.core.Message]]s
@@ -89,6 +109,8 @@ object Channel {
  * if a channel should ignore a message or not.
  *
  * A `DefaultChannel` preserves the `sender` reference (i.e. forwards it to `destination`).
+ * Furthermore, it can only be used in combination with an `Eventsourced` processor as
+ * described in the documentation of [[org.eligosource.eventsourced.core.Channel]].
  *
  * @param id channel id. Must be a positive integer.
  * @param journal journal of the [[org.eligosource.eventsourced.core.EventsourcingExtension]]
@@ -96,13 +118,9 @@ object Channel {
  * @param destination delivery destination of event messages added to this channel.
  *
  * @see [[org.eligosource.eventsourced.core.Channel]]
- * @see [[org.eligosource.eventsourced.core.Journal.WriteAck]]
+ * @see [[org.eligosource.eventsourced.core.JournalProtocol.WriteAck]]
  */
 class DefaultChannel(val id: Int, val journal: ActorRef, val destination: ActorRef) extends Channel {
-  import Channel.Deliver
-
-  require(id > 0, "channel id must be a positive integer")
-
   private var retain = true
   private var buffer = List.empty[Message]
 
@@ -110,6 +128,9 @@ class DefaultChannel(val id: Int, val journal: ActorRef, val destination: ActorR
     case msg: Message if (!msg.acks.contains(id)) => {
       if (retain) buffer = msg :: buffer
       else send(msg)
+    }
+    case Confirmation(pid, `id`, snr, true) => {
+      journal forward WriteAck(pid, id, snr)
     }
     case Deliver => {
       retain = false
@@ -119,9 +140,9 @@ class DefaultChannel(val id: Int, val journal: ActorRef, val destination: ActorR
   }
 
   def send(msg: Message) {
-    val pct = if (msg.ack) journal else null
-    val pcm = if (msg.ack) WriteAck(msg.processorId, id, msg.sequenceNr) else null
-    destination forward msg.copy(posConfirmationTarget = pct, posConfirmationMessage = pcm)
+    val ct = if (msg.ack) self else null
+    val cp = if (msg.ack) Confirmation(msg.processorId, id, msg.sequenceNr, true) else null
+    destination forward msg.copy(confirmationTarget = ct, confirmationPrototype = cp)
   }
 }
 
@@ -141,7 +162,23 @@ case class RedeliveryPolicy(
   restartDelay: FiniteDuration,
   restartMax: Int,
   redeliveryDelay: FiniteDuration,
-  redeliveryMax: Int)
+  redeliveryMax: Int) {
+
+  def withConfirmationTimeout(confirmationTimeout: FiniteDuration) =
+    copy(confirmationTimeout = confirmationTimeout)
+
+  def withRestartDelay(restartDelay: FiniteDuration) =
+    copy(restartDelay = restartDelay)
+
+  def withRestartMax(restartMax: Int) =
+    copy(restartMax = restartMax)
+
+  def withRedeliveryDelay(redeliveryDelay: FiniteDuration) =
+    copy(redeliveryDelay = redeliveryDelay)
+
+  def withRedeliveryMax(redeliveryMax: Int) =
+    copy(redeliveryMax = redeliveryMax)
+}
 
 object RedeliveryPolicy {
   /** Default confirmation timeout: 5 seconds */
@@ -164,6 +201,13 @@ object RedeliveryPolicy {
     DefaultRestartMax,
     DefaultRedeliveryDelay,
     DefaultRedeliveryMax)
+
+  /**
+   * Java API.
+   *
+   * Returns a [[org.eligosource.eventsourced.core.RedeliveryPolicy]] with default settings.
+   */
+  def create = apply()
 }
 
 /**
@@ -182,14 +226,34 @@ object RedeliveryPolicy {
  * the channel restarts itself after a certain ''restart delay'' (specified by `policy.restartDelay`)
  * and starts again with re-deliveries. If the maximum number of restarts has been reached (specified
  * by `policy.restartMax`) the channel stops message delivery and publishes a
- * [[org.eligosource.eventsourced.core.Channel.DeliveryStopped]] event to the event stream of the
+ * [[org.eligosource.eventsourced.core.DeliveryStopped]] event to the event stream of the
  * [[akka.actor.ActorSystem]] this channel belongs to. Applications can then re-activate the channel
  * by calling `EventsourcingExtension.deliver(Int)` with the channel id as argument.
  *
- * A `ReliableChannel` stores `sender` references along with event messages. A destination can even
- * reply to a sender that was sending an event message in a previous application run (e.g. before the
- * application crashed). If that sender doesn't exist any more after recovery, the reply will go to
- * `deadLetters`.
+ * A `ReliableChannel` stores `sender` references along with event messages so that they can be forwarded
+ * to destinations even after the channel has been restarted. If a stored sender reference is a remote
+ * reference, it remains valid even after recovery from a JVM crash (i.e. a crash of the JVM the channel
+ * is running in) provided the remote sender is still available.
+ *
+ * Usually, a `ReliableChannel` is used in combination with an `Eventsourced` processor, as described
+ * in the documentation of [[org.eligosource.eventsourced.core.Channel]]. A `ReliableChannel` can also
+ * be used independently of an `Eventsourced` processor (i.e. standalone). For standalone channel usage,
+ * senders must set the `Message.processorId` of the sent `Message` to `0` (which is the default value):
+ *
+ * {{{
+ *   channel ! Message("my event") // processorId == 0
+ * }}}
+ *
+ * This is equivalent to directly sending the `Message.event`:
+ *
+ * {{{
+ *   channel ! "my event"
+ * }}}
+ *
+ * A `ReliableChannel` internally wraps a received event into a `Message` with `processorId` set to `0`.
+ * Setting the `processorId` to `0` causes a reliable channel to skip writing an acknowledgement. An
+ * acknowledgement always refers to an event message received by an  `Eventsourced` processor, so there's
+ * no need to write one in this case.
  *
  * @param id channel id. Must be a positive integer.
  * @param journal journal of the [[org.eligosource.eventsourced.core.EventsourcingExtension]]
@@ -200,24 +264,20 @@ object RedeliveryPolicy {
  *
  * @see [[org.eligosource.eventsourced.core.Channel]]
  * @see [[org.eligosource.eventsourced.core.RedeliveryPolicy]]
- * @see [[org.eligosource.eventsourced.core.Journal.WriteOutMsg]]
- * @see [[org.eligosource.eventsourced.core.Journal.WriteAck]]
+ * @see [[org.eligosource.eventsourced.core.JournalProtocol.WriteOutMsg]]
+ * @see [[org.eligosource.eventsourced.core.JournalProtocol.WriteAck]]
  */
 class ReliableChannel(val id: Int, val journal: ActorRef, val destination: ActorRef, policy: RedeliveryPolicy, dispatcherName: Option[String] = None) extends Channel {
   import ReliableChannel._
-  import Channel._
-
-
-  require(id > 0, "channel id must be a positive integer")
+  import context.dispatcher
 
   private var buffer: Option[ActorRef] = None
   private var restarts = 0
 
   def receive = {
-    case msg: Message if (!msg.acks.contains(id)) => {
-      val ackSequenceNr: Long = if (msg.ack) msg.sequenceNr else SkipAck
-      val senderPath = sender.path.toString
-      journal forward WriteOutMsg(id, msg.copy(senderPath = senderPath), msg.processorId, ackSequenceNr, buffer.getOrElse(context.system.deadLetters))
+    case msg: Message => {
+      if       (msg.processorId == 0)  storeAndBufferMessage(msg.copy(ack = false))
+      else if (!msg.acks.contains(id)) storeAndBufferMessage(msg)
     }
     case Deliver => if (!buffer.isDefined) {
       buffer = Some(createBuffer())
@@ -236,6 +296,12 @@ class ReliableChannel(val id: Int, val journal: ActorRef, val destination: Actor
         context.system.eventStream.publish(DeliveryStopped(id))
       }
     }
+    case event => receive(Message(event))
+  }
+
+  private def storeAndBufferMessage(msg: Message) {
+    val ackSequenceNr: Long = if (msg.ack) msg.sequenceNr else SkipAck
+    journal forward WriteOutMsg(id, msg.copy(senderRef = sender), msg.processorId, ackSequenceNr, buffer.getOrElse(context.system.deadLetters))
   }
 
   private def deliverPendingMessages(dst: ActorRef) {
@@ -246,7 +312,7 @@ class ReliableChannel(val id: Int, val journal: ActorRef, val destination: Actor
     context.watch(actor(new ReliableChannelBuffer(id, journal, destination, policy, dispatcherName), dispatcherName = dispatcherName))
 }
 
-private [core] object ReliableChannel {
+private [eventsourced] object ReliableChannel {
   case class Buffered(queue: Queue[Message])
   case class Next(retries: Int)
   case class Retry(msg: Message, sdr: ActorRef)
@@ -254,9 +320,6 @@ private [core] object ReliableChannel {
   case object Trigger
   case object FeedMe
   case object ResetRestartCounter
-
-  case class Confirmed(snr: Long, pos: Boolean = true)
-  case class ConfirmationTimeout(snr: Long)
 }
 
 private [core] class ReliableChannelBuffer(channelId: Int, journal: ActorRef, destination: ActorRef, policy: RedeliveryPolicy, dispatcherName: Option[String]) extends Actor {
@@ -291,8 +354,8 @@ private [core] class ReliableChannelBuffer(channelId: Int, journal: ActorRef, de
 
 private [core] class ReliableChannelDeliverer(channelId: Int, channel: ActorRef, journal: ActorRef, destination: ActorRef, policy: RedeliveryPolicy) extends Actor {
   import ReliableChannel._
+  import context.dispatcher
 
-  implicit val executionContext = context.dispatcher
   val scheduler = context.system.scheduler
 
   var buffer: Option[ActorRef] = None
@@ -314,13 +377,11 @@ private [core] class ReliableChannelDeliverer(channelId: Int, channel: ActorRef,
     case Next(r) => if (queue.size > 0) {
       val (msg, q) = queue.dequeue
       val m = msg.copy(
-        senderPath = null,
-        posConfirmationTarget = self,
-        negConfirmationTarget = self,
-        posConfirmationMessage = Confirmed(msg.sequenceNr, true),
-        negConfirmationMessage = Confirmed(msg.sequenceNr, false))
+        senderRef = null,
+        confirmationTarget = self,
+        confirmationPrototype = Confirmation(msg.processorId, channelId, msg.sequenceNr, true))
 
-      val sdr = if (msg.senderPath == null) context.system.deadLetters else context.actorFor(msg.senderPath)
+      val sdr = if (msg.senderRef == null) context.system.deadLetters else msg.senderRef
 
       destination tell (m, sdr)
 
@@ -342,13 +403,13 @@ private [core] class ReliableChannelDeliverer(channelId: Int, channel: ActorRef,
       }
     }
 
-    case Confirmed(snr, true) => currentDelivery match {
+    case Confirmation(_, _, snr, true) => currentDelivery match {
       case Some((cm, cs, task)) => if (cm.sequenceNr == snr) {
         currentDelivery = None; task.cancel(); journal ! DeleteOutMsg(channelId, snr); self ! Next(0); redeliveries = 0; delivered = true
       }
       case None => ()
     }
-    case Confirmed(snr, false) => currentDelivery match {
+    case Confirmation(_, _, snr, false) => currentDelivery match {
       case Some((cm, cs, task)) => if (cm.sequenceNr == snr) {
         currentDelivery = None; task.cancel(); scheduler.scheduleOnce(policy.redeliveryDelay, self, Retry(cm, cs))
       }

@@ -21,8 +21,7 @@ import java.util.concurrent.LinkedBlockingQueue
 import akka.actor._
 
 import org.eligosource.eventsourced.core.DefaultChannelSpec._
-import org.eligosource.eventsourced.core.Channel._
-import org.eligosource.eventsourced.core.Journal._
+import org.eligosource.eventsourced.core.JournalProtocol._
 
 class DefaultChannelSpec extends EventsourcingSpec[Fixture] {
   "A default channel" must {
@@ -61,8 +60,8 @@ class DefaultChannelSpec extends EventsourcingSpec[Fixture] {
       c ! Deliver
       c ! Message("b", processorId = 3, sequenceNr = 11)
 
-      dequeue { m => m.posConfirmationTarget must be(journal); m.posConfirmationMessage must be(WriteAck(3, 1, 10)) }
-      dequeue { m => m.posConfirmationTarget must be(journal); m.posConfirmationMessage must be(WriteAck(3, 1, 11)) }
+      dequeue { m => m.confirmationTarget must be(c); m.confirmationPrototype must be(Confirmation(3, 1, 10, true)) }
+      dequeue { m => m.confirmationTarget must be(c); m.confirmationPrototype must be(Confirmation(3, 1, 11, true)) }
     }
     "not set posConfirmationTarget and posConfirmationMessage on delivered message if ack is not required" in { fixture =>
       import fixture._
@@ -74,9 +73,9 @@ class DefaultChannelSpec extends EventsourcingSpec[Fixture] {
       c ! Message("b", processorId = 3, sequenceNr = 11, ack = false)
       c ! Message("c", processorId = 3, sequenceNr = 12)
 
-      dequeue { m => m.posConfirmationTarget must be(null) }
-      dequeue { m => m.posConfirmationTarget must be(null) }
-      dequeue { m => m.posConfirmationTarget must be(journal); m.posConfirmationMessage must be(WriteAck(3, 1, 12)) }
+      dequeue { m => m.confirmationTarget must be(null) }
+      dequeue { m => m.confirmationTarget must be(null) }
+      dequeue { m => m.confirmationTarget must be(c); m.confirmationPrototype must be(Confirmation(3, 1, 12, true)) }
     }
     "not set negConfirmationTarget and negConfirmationMessage on delivered message" in { fixture =>
       import fixture._
@@ -88,9 +87,6 @@ class DefaultChannelSpec extends EventsourcingSpec[Fixture] {
       c ! Deliver
       c ! Message("a", processorId = 3, sequenceNr = 10)
       c ! Message("b", processorId = 3, sequenceNr = 11)
-
-      // destination only enqueues received messages on success
-      dequeue { m => m.negConfirmationTarget must be(null) }
 
       // doesn't happen because destination calls msg.confirm(false)
       //dequeue(writeAckListenerQueue) must be (WriteAck(3, 1, 10))
@@ -109,6 +105,12 @@ class DefaultChannelSpec extends EventsourcingSpec[Fixture] {
       respondTo(Message("a")) must be("re: a")
       respondTo(Message("b")) must be("re: b")
     }
+    "not have an id < 1" in { fixture =>
+      import fixture._
+
+      intercept[InvalidChannelIdException](extension.channelOf(DefaultChannelProps(0, successDestination)))
+      intercept[InvalidChannelIdException](extension.channelOf(DefaultChannelProps(-1, successDestination)))
+    }
   }
 }
 
@@ -121,7 +123,7 @@ object DefaultChannelSpec {
     val writeAckListener = system.actorOf(Props(new WriteAckListener(writeAckListenerQueue)))
 
     def channel(destination: ActorRef) =
-      system.actorOf(Props(new DefaultChannel(1, journal, destination)))
+      extension.channelOf(DefaultChannelProps(1, destination))
 
     def message(event: Any, sequenceNr: Long = 0L, ack: Boolean = true) =
       Message(event, sequenceNr = sequenceNr, ack = ack, processorId = 1)

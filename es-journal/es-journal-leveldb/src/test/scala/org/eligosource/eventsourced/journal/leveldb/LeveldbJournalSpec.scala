@@ -17,14 +17,11 @@ package org.eligosource.eventsourced.journal.leveldb
 
 import java.io.File
 
-import org.apache.commons.io.FileUtils
-import org.scalatest.BeforeAndAfterEach
-
 import org.eligosource.eventsourced.core._
-import org.eligosource.eventsourced.core.Journal._
-import org.eligosource.eventsourced.journal.common.JournalSpec
+import org.eligosource.eventsourced.core.JournalProtocol._
+import org.eligosource.eventsourced.journal.common._
 
-abstract class LeveldbJournalPSSpec extends JournalSpec {
+abstract class LeveldbJournalSpec extends PersistentJournalSpec {
   import JournalSpec._
 
   "persist input messages with a custom event serializer" in { fixture =>
@@ -51,30 +48,22 @@ abstract class LeveldbJournalPSSpec extends JournalSpec {
   }
 }
 
-object LeveldbJournalPSSpec {
+object LeveldbJournalSpec {
   val journalDir = new File("es-journal/es-journal-leveldb/target/journal")
 }
 
-class LeveldbJournalPSDefaultSpec extends LeveldbJournalPSSpec with BeforeAndAfterEach {
-  def journalProps = LeveldbJournalProps(LeveldbJournalPSSpec.journalDir)
-
-  override def afterEach() {
-    FileUtils.deleteDirectory(LeveldbJournalPSSpec.journalDir)
-  }
+class LeveldbJournalPSNativeSpec extends LeveldbJournalSpec with LeveldbCleanup {
+  def journalProps = LeveldbJournalProps(LeveldbJournalSpec.journalDir)
 }
 
-class LeveldbJournalPSThrottledSpec extends LeveldbJournalPSSpec with BeforeAndAfterEach {
-  def journalProps = LeveldbJournalProps(LeveldbJournalPSSpec.journalDir).withThrottledReplay(10000)
-
-  override def afterEach() {
-    FileUtils.deleteDirectory(LeveldbJournalPSSpec.journalDir)
-  }
+class LeveldbJournalSSNativeSpec extends JournalSpec with LeveldbCleanup {
+  def journalProps = LeveldbJournalProps(LeveldbJournalSpec.journalDir).withSequenceStructure
 }
 
-class LeveldbJournalSSSpec extends JournalSpec with BeforeAndAfterEach {
-  def journalProps = LeveldbJournalProps(LeveldbJournalPSSpec.journalDir).withSequenceStructure
+class LeveldbJournalPSJavaSpec extends LeveldbJournalSpec with LeveldbCleanup {
+  def journalProps = LeveldbJournalProps(LeveldbJournalSpec.journalDir).withNative(false)
+}
 
-  override def afterEach() {
-    FileUtils.deleteDirectory(LeveldbJournalPSSpec.journalDir)
-  }
+class LeveldbJournalSSJavaSpec extends JournalSpec with LeveldbCleanup {
+  def journalProps = LeveldbJournalProps(LeveldbJournalSpec.journalDir).withSequenceStructure.withNative(false)
 }

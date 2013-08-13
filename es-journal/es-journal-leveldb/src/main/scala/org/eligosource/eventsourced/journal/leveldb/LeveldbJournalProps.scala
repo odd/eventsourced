@@ -21,15 +21,21 @@ import scala.concurrent.duration._
 
 import akka.actor.Actor
 
-import org.eligosource.eventsourced.core._
+import org.apache.hadoop.fs.{FileSystem, Path}
+
+import org.eligosource.eventsourced.journal.common.JournalProps
+import org.eligosource.eventsourced.journal.common.serialization.SnapshotSerializer
+import org.eligosource.eventsourced.journal.common.snapshot.HadoopFilesystemSnapshottingProps
+import org.eligosource.eventsourced.journal.common.snapshot.HadoopFilesystemSnapshotting.defaultLocalFilesystem
 
 /**
- * Configuration object for a [[http://code.google.com/p/leveldb/ LevelDB]] based journal. This
- * journal comes with different optimizations to choose from, as described at the methods
+ * Configuration object for a [[http://code.google.com/p/leveldb/ LevelDB]] based journal.
+ * Applications may also choose to use a [[https://github.com/dain/leveldb Java port]] of
+ * LevelDB that doesn't run native code (see `native` field). This journal comes with
+ * different optimizations to choose from, as described at the methods
  *
  *  - `withProcessorStructure`
  *  - `withSequenceStructure`
- *  - `withThrottledReplay`
  *
  * Journal actors can be created from a configuration object as follows:
  *
@@ -52,12 +58,11 @@ import org.eligosource.eventsourced.core._
  * @param dispatcherName Optional journal actor dispatcher name.
  * @param fsync `true` if every write is physically synced. Default is `false`.
  * @param checksum `true` if checksums are verified on read. Default is `false`.
+ * @param native `true` if the [[http://code.google.com/p/leveldb/ native LevelDB]]
+ *        should be used (default), `false` for using a
+ *        [[https://github.com/dain/leveldb Java port]].
  * @param processorStructured `true` if entries are primarily ordered by processor
  *        id, `false` if entries are ordered by sequence number.  Default is `true`.
- * @param throttleAfter `0` if replay throttling is turned off, or a positive integer
- *        to `throttleFor` after the specified number of replayed event messages.
- * @param throttleFor Suspend replay for specified duration after `throttleAfter`
- *        replayed event messages.
  */
 case class LeveldbJournalProps(
   dir: File,
@@ -65,9 +70,21 @@ case class LeveldbJournalProps(
   dispatcherName: Option[String] = None,
   fsync: Boolean = false,
   checksum: Boolean = false,
+  native: Boolean = true,
   processorStructured: Boolean = true,
-  throttleAfter: Int = 0,
-  throttleFor: FiniteDuration = 100 milliseconds) extends JournalProps {
+  snapshotDir: Path = new Path("snapshots"),
+  snapshotSerializer: SnapshotSerializer = SnapshotSerializer.java,
+  snapshotLoadTimeout: FiniteDuration = 1 hour,
+  snapshotSaveTimeout: FiniteDuration = 1 hour,
+  snapshotFilesystem: FileSystem = defaultLocalFilesystem)
+  extends JournalProps with HadoopFilesystemSnapshottingProps[LeveldbJournalProps] {
+
+  val snapshotPath =
+    if (!snapshotDir.isAbsolute && snapshotFilesystem == defaultLocalFilesystem) {
+      // default local file system and relative snapshot dir:
+      // store snapshots relative to journal dir
+      new Path(new Path(dir.toURI), snapshotDir)
+    } else snapshotDir
 
   /**
    *  Returns `false` if entries are primarily ordered by processor id,
@@ -77,34 +94,44 @@ case class LeveldbJournalProps(
     !processorStructured
 
   /**
-   * Returns `true` if replay will be throttled. Only for `processorStructured == true`.
-   */
-  def throttledReplay =
-    processorStructured && (throttleAfter != 0)
-
-  /**
+   * Java API.
+   *
    * Returns a new `LeveldbJournalProps` with specified journal actor name.
    */
   def withName(name: String) =
     copy(name = Some(name))
 
   /**
+   * Java API.
+   *
    * Returns a new `LeveldbJournalProps` with specified journal actor dispatcher name.
    */
   def withDispatcherName(dispatcherName: String) =
     copy(dispatcherName = Some(dispatcherName))
 
   /**
+   * Java API.
+   *
    * Returns a new `LeveldbJournalProps` with specified physical sync setting.
    */
   def withFsync(fsync: Boolean) =
     copy(fsync = fsync)
 
   /**
+   * Java API.
+   *
    * Returns a new `LeveldbJournalProps` with specified checksum verification setting.
    */
   def withChecksum(checksum: Boolean) =
     copy(checksum = checksum)
+
+  /**
+   * Java API.
+   *
+   * Returns a new `LeveldbJournalProps` with specified native setting.
+   */
+  def withNative(native: Boolean) =
+    copy(native = native)
 
   /**
    * Returns a new `LeveldbJournalProps` with `processorStructured` set to `true` and
@@ -143,23 +170,58 @@ case class LeveldbJournalProps(
     copy(processorStructured = false)
 
   /**
-   * Returns a new `LeveldbJournalProps` with specified replay throttling settings. Can be used
-   * to avoid growing of mailboxes of slow processors during replay. Only has effect if
-   * `processorStructured == true`.
+   * Java API.
+   *
+   * Returns a new `LeveldbJournalProps` with specified snapshot directory.
    */
-  def withThrottledReplay(throttleAfter: Int, throttleFor: FiniteDuration = 100 milliseconds) =
-    copy(throttleAfter = throttleAfter, throttleFor = throttleFor)
+  def withSnapshotDir(snapshotDir: Path) =
+    copy(snapshotDir = snapshotDir)
 
-  def journal: Actor = {
-    import LeveldbReplay._
+  /**
+   * Java API.
+   *
+   * Returns a new `LeveldbJournalProps` with specified snapshot serializer.
+   */
+  def withSnapshotSerializer(snapshotSerializer: SnapshotSerializer) =
+    copy(snapshotSerializer = snapshotSerializer)
 
-    if (throttledReplay) {
-      new LeveldbJournalPS(this, throttledReplayStrategy)
-    } else if (processorStructured) {
-      new LeveldbJournalPS(this, defaultReplayStrategy)
+  /**
+   * Java API.
+   *
+   * Returns a new `LeveldbJournalProps` with specified snapshot load timeout.
+   */
+  def withSnapshotLoadTimeout(snapshotLoadTimeout: FiniteDuration) =
+    copy(snapshotLoadTimeout = snapshotLoadTimeout)
+
+  /**
+   * Java API.
+   *
+   * Returns a new `LeveldbJournalProps` with specified snapshot save timeout.
+   */
+  def withSnapshotSaveTimeout(snapshotSaveTimeout: FiniteDuration) =
+    copy(snapshotSaveTimeout = snapshotSaveTimeout)
+
+  /**
+   * Java API.
+   *
+   * Returns a new `LeveldbJournalProps` with specified snapshot filesystem.
+   */
+  def withSnapshotFilesystem(snapshotFilesystem: FileSystem) =
+    copy(snapshotFilesystem = snapshotFilesystem)
+
+  def createJournalActor: Actor = {
+    if (processorStructured) {
+      new LeveldbJournalPS(this)
     } else {
       new LeveldbJournalSS(this)
     }
   }
 }
 
+object LeveldbJournalProps {
+  /**
+   * Java API.
+   */
+  def create(dir: File): LeveldbJournalProps =
+    LeveldbJournalProps(dir)
+}

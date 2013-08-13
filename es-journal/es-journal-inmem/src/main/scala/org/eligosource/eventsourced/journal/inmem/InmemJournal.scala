@@ -16,19 +16,22 @@
 package org.eligosource.eventsourced.journal.inmem
 
 import scala.collection.immutable.SortedMap
+import scala.concurrent.Future
 
 import akka.actor._
 
 import org.eligosource.eventsourced.core._
-import org.eligosource.eventsourced.journal.common._
+import org.eligosource.eventsourced.journal.common.support.SynchronousWriteReplaySupport
+import org.eligosource.eventsourced.journal.common.util._
 
 /**
  * In-memory journal for testing purposes.
  */
-private [eventsourced] class InmemJournal extends SequentialWriteJournal {
-  import Journal._
+private [eventsourced] class InmemJournal extends SynchronousWriteReplaySupport {
+  import JournalProtocol._
 
   var redoMap = SortedMap.empty[Key, Any]
+  var snapshots = Map.empty[Int, List[Snapshot]]
 
   def executeWriteInMsg(cmd: WriteInMsg) {
     redoMap = redoMap + (Key(cmd.processorId, 0, counter, 0) -> cmd.message.clearConfirmationSettings)
@@ -51,24 +54,38 @@ private [eventsourced] class InmemJournal extends SequentialWriteJournal {
   }
 
   def executeBatchReplayInMsgs(cmds: Seq[ReplayInMsgs], p: (Message, ActorRef) => Unit) {
-    cmds.foreach(cmd => replay(cmd.processorId, 0, cmd.fromSequenceNr, msg => p(msg, cmd.target)))
-    sender ! ReplayDone
+    cmds.foreach(cmd => replay(cmd.processorId, 0, cmd.fromSequenceNr, cmd.toSequenceNr, msg => p(msg, cmd.target)))
   }
 
   def executeReplayInMsgs(cmd: ReplayInMsgs, p: Message => Unit) {
-    replay(cmd.processorId, 0, cmd.fromSequenceNr, p)
-    sender ! ReplayDone
+    replay(cmd.processorId, 0, cmd.fromSequenceNr, cmd.toSequenceNr, p)
   }
 
   def executeReplayOutMsgs(cmd: ReplayOutMsgs, p: Message => Unit) {
-    replay(Int.MaxValue, cmd.channelId, cmd.fromSequenceNr, p)
+    replay(Int.MaxValue, cmd.channelId, cmd.fromSequenceNr, Long.MaxValue, p)
   }
+
+  override def loadSnapshotSync(processorId: Int, snapshotFilter: SnapshotMetadata => Boolean) = for {
+    ss <- snapshots.get(processorId)
+    fs <- ss.filter(snapshotFilter).headOption
+  } yield fs
+
+  override def saveSnapshot(snapshot: Snapshot) = {
+    snapshots.get(snapshot.processorId) match {
+      case None     => snapshots = snapshots + (snapshot.processorId -> List(snapshot))
+      case Some(ss) => snapshots = snapshots + (snapshot.processorId -> (snapshot :: ss))
+    }
+    Future.successful(SnapshotSaved(snapshot.processorId, snapshot.sequenceNr, snapshot.timestamp))
+  }
+
+  def snapshotSaved(metadata: SnapshotMetadata) {}
 
   def storedCounter = counter
 
-  private def replay(processorId: Int, channelId: Int, fromSequenceNr: Long, p: Message => Unit) {
+  private def replay(processorId: Int, channelId: Int, fromSequenceNr: Long, toSequenceNr: Long, p: Message => Unit) {
     val startKey = Key(processorId, channelId, fromSequenceNr, 0)
-    val iter = redoMap.from(startKey).iterator.buffered
+    val stopKey = Key(processorId, channelId, toSequenceNr, 0)
+    val iter = redoMap.from(startKey).to(stopKey).iterator.buffered
     replay(iter, startKey, p)
   }
 
@@ -103,13 +120,4 @@ private [eventsourced] class InmemJournal extends SequentialWriteJournal {
       } else channelIds
     } else channelIds
   }
-}
-
-/**
- * @see [[org.eligosource.eventsourced.journal.InmemJournalProps]]
- */
-object InmemJournal {
-  @deprecated("use Journal(InmemJournalProps(dir)) instead", "0.5")
-  def apply(name: Option[String] = None, dispatcherName: Option[String] = None)(implicit system: ActorSystem): ActorRef =
-    Journal(InmemJournalProps(name, dispatcherName))
 }
